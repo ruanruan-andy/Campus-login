@@ -1,0 +1,13 @@
+*
+!.gitignore
+!CampusLogin.swift
+!portal.py
+!Info.plist
+!AppIcon.icns
+!MakeIcon.swift
+!build.sh
+!README.md
+!packaging/
+!packaging/background.swift
+!packaging/layout.py
+!packaging/bookmark.swift
