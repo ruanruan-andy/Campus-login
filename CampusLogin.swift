@@ -125,13 +125,13 @@ enum Outcome: String, Decodable, Sendable {
     case online, restored, offline, credentialsRequired = "credentials_required"
     case portalChanged = "portal_changed", portalError = "portal_error"
     case authenticationFailed = "authentication_failed", acceptedOffline = "accepted_offline"
-    case sshFailed, localNetwork, sshKey, remoteError, timedOut, wifiFailed
+    case sshFailed, localNetwork, sshKey, remoteError, timedOut, wifiFailed, wifiDisconnected
 
-    var title: String {
+    func title(isLocal: Bool) -> String {
         switch self {
         case .online: "已联网"
-        case .restored: "外网已恢复"
-        case .offline: "外网不可用"
+        case .restored: isLocal ? "本机网络已恢复" : "外网已恢复"
+        case .offline: isLocal ? "暂时无法联网" : "未检测到校园网登录页"
         case .credentialsRequired: "需要登录校园网"
         case .portalChanged: "无法识别认证页面"
         case .portalError: "校园网网关异常"
@@ -140,27 +140,34 @@ enum Outcome: String, Decodable, Sendable {
         case .sshFailed: "SSH 连接失败"
         case .localNetwork: "无法连接服务器"
         case .sshKey: "SSH 密钥未通过认证"
-        case .remoteError: "服务器命令执行失败"
+        case .remoteError: isLocal ? "本机联网检查失败" : "服务器命令执行失败"
         case .timedOut: "请求超时"
         case .wifiFailed: "校园 Wi-Fi 未就绪"
+        case .wifiDisconnected: "未连接 SUDA_WIFI"
         }
     }
 
-    var detail: String {
+    func detail(isLocal: Bool) -> String {
         switch self {
-        case .online, .restored: "服务器已通过直连方式访问外网。"
-        case .offline: "服务器无法访问外网，也没有检测到校园网认证页面。"
+        case .online, .restored: isLocal ? "本机已通过联网检查。" : "服务器已通过直连方式访问外网。"
+        case .offline: isLocal
+            ? "本机未能通过联网检查，也未检测到校园网登录页。"
+            : "已连接服务器。联网检查未通过，暂时无法判断校园网认证状态。"
         case .credentialsRequired: "请在「编辑」中确认校园网账号、密码和运营商，再点「登录校园网」。"
         case .portalChanged: "此版本支持苏州大学的 Dr.COM 认证网关。"
         case .portalError: "无法访问校园网网关，或网关返回了无法识别的响应。"
         case .authenticationFailed: "请核对该服务器使用的校园网账号、密码和运营商。"
-        case .acceptedOffline: "网关已接受登录，但外网检查仍未通过。"
+        case .acceptedOffline: isLocal
+            ? "网关已接受登录，本机的联网检查仍未通过。"
+            : "网关已接受登录，但外网检查仍未通过。"
         case .sshFailed: "请在终端检查 SSH 别名、主机密钥和密钥认证。"
         case .localNetwork: "请到「系统设置 → 隐私与安全性 → 本地网络」确认此应用有访问权限，再重试。"
         case .sshKey: "请在终端解锁 SSH 密钥，或将密钥添加到 macOS 的 SSH 代理后重试。"
-        case .remoteError: "SSH 命令未返回结果。请确认服务器已安装 python3 和 curl。"
-        case .timedOut: "所选服务器未能在规定时间内完成检查。"
-        case .wifiFailed: "请确认 Wi-Fi 已开启、SUDA_WIFI 在信号范围内，并允许本应用使用定位服务。"
+        case .remoteError: isLocal
+            ? "本机检查程序未返回结果。请确认 Mac 上的 python3 和 curl 可用。"
+            : "SSH 命令未返回结果。请确认服务器已安装 python3 和 curl。"
+        case .timedOut: isLocal ? "本机联网检查超时，请重试。" : "所选服务器未能在规定时间内完成检查。"
+        case .wifiFailed, .wifiDisconnected: "请确认 Wi-Fi 已开启、SUDA_WIFI 在信号范围内，并允许本应用使用定位服务。"
         }
     }
 
@@ -227,7 +234,7 @@ enum CampusWiFi {
             return ServerResult(outcome: .wifiFailed, detail: "未找到可用的 Wi-Fi 网卡。")
         }
         guard interface.powerOn() else {
-            return ServerResult(outcome: .wifiFailed, detail: "请先开启 Mac 的 Wi-Fi，再重试。")
+            return ServerResult(outcome: .wifiDisconnected, detail: "请先开启 Mac 的 Wi-Fi，再重试。")
         }
         do {
             if interface.ssid() != ssid {
@@ -235,7 +242,7 @@ enum CampusWiFi {
                 guard let network = networks
                     .filter({ $0.ssid == ssid })
                     .max(by: { $0.rssiValue < $1.rssiValue }) else {
-                    return ServerResult(outcome: .wifiFailed, detail: "未发现 SUDA_WIFI，请确认校园 Wi-Fi 在信号范围内。")
+                    return ServerResult(outcome: .wifiDisconnected, detail: "未发现 SUDA_WIFI，请确认校园 Wi-Fi 在信号范围内。")
                 }
                 try interface.associate(to: network, password: nil)
             }
@@ -244,9 +251,12 @@ enum CampusWiFi {
                 if interface.ssid() == ssid && hasAddress(name) { return nil }
                 Thread.sleep(forTimeInterval: 0.5)
             } while Date() < deadline
+            guard interface.ssid() == ssid else {
+                return ServerResult(outcome: .wifiDisconnected, detail: "Wi-Fi 未能保持连接，请确认 SUDA_WIFI 信号后重试。")
+            }
             return ServerResult(outcome: .wifiFailed, detail: "连接 SUDA_WIFI 后尚未获得有效网络地址，请稍后重试。")
         } catch {
-            return ServerResult(outcome: .wifiFailed, detail: "连接 SUDA_WIFI 失败：" + error.localizedDescription)
+            return ServerResult(outcome: .wifiDisconnected, detail: "连接 SUDA_WIFI 失败：" + error.localizedDescription)
         }
     }
 }
@@ -287,7 +297,7 @@ enum CampusSSH {
         do {
             try process.run()
         } catch {
-            return ServerResult(outcome: .sshFailed)
+            return ServerResult(outcome: server.isLocal == true ? .remoteError : .sshFailed)
         }
 
         let timeout = DispatchWorkItem {
@@ -306,7 +316,7 @@ enum CampusSSH {
         process.waitUntilExit()
 
         if process.terminationReason == .uncaughtSignal { return ServerResult(outcome: .timedOut) }
-        if process.terminationStatus == 255 {
+        if server.isLocal != true && process.terminationStatus == 255 {
             let diagnostic = String(decoding: data, as: UTF8.self).lowercased()
             if diagnostic.contains("permission denied (publickey") { return ServerResult(outcome: .sshKey) }
             if ["no route to host", "operation not permitted", "network is unreachable"].contains(where: diagnostic.contains) {
@@ -323,6 +333,7 @@ enum CampusSSH {
 struct MainView: View {
     @AppStorage("servers") private var savedServers = Data()
     @AppStorage("selectedServer") private var savedSelection = ""
+    @AppStorage("automaticPauseUntil") private var automaticPauseUntil: Double = 0
     @State private var servers = [Server]()
     @State private var selection: UUID?
     @State private var editor: Server?
@@ -331,7 +342,7 @@ struct MainView: View {
     @State private var active: UUID?
     @State private var errorMessage: String?
     @State private var lastChecks = [UUID: Date]()
-    @State private var automaticPaused = false
+    @State private var isClearingData = false
     private let timer = Timer.publish(every: 15, on: .main, in: .common).autoconnect()
 
     private var selected: Server? { servers.first { $0.id == selection } }
@@ -396,9 +407,10 @@ struct MainView: View {
             persist()
             selection = servers.first { $0.id.uuidString == savedSelection }?.id ?? servers.first?.id
         }
-        .onReceive(timer) { _ in
-            guard active == nil, !automaticPaused else { return }
-            let now = Date()
+        .onReceive(timer) { now in
+            guard now.timeIntervalSince1970 >= automaticPauseUntil else { return }
+            if automaticPauseUntil != 0 { automaticPauseUntil = 0 }
+            guard active == nil, !isClearingData else { return }
             if let server = servers.first(where: {
                 $0.automatic == true &&
                 now.timeIntervalSince(lastChecks[$0.id] ?? .distantPast) >= Double($0.intervalMinutes ?? 5) * 60
@@ -406,26 +418,20 @@ struct MainView: View {
                 connect(server, authenticate: true, automatic: true)
             }
         }
-        .onReceive(NotificationCenter.default.publisher(for: .pauseCampusAutomatic)) { _ in
-            automaticPaused.toggle()
-        }
         .onReceive(NotificationCenter.default.publisher(for: .clearCampusData)) { _ in
             guard active == nil else {
                 errorMessage = "请等待当前联网检查结束后再清除数据。"
                 return
             }
-            let wasPaused = automaticPaused
-            automaticPaused = true
+            isClearingData = true
+            defer { isClearingData = false }
             let alert = NSAlert()
             alert.messageText = "清除全部数据并退出？"
             alert.informativeText = "将永久删除所有设备配置、校园网账号和本应用保存的钥匙串密码。"
             alert.alertStyle = .warning
             alert.addButton(withTitle: "取消")
             alert.addButton(withTitle: "清除并退出")
-            guard alert.runModal() == .alertSecondButtonReturn else {
-                automaticPaused = wasPaused
-                return
-            }
+            guard alert.runModal() == .alertSecondButtonReturn else { return }
             do {
                 try Passwords.deleteAll()
                 servers = []
@@ -480,6 +486,7 @@ struct MainView: View {
     private func detail(for server: Server) -> some View {
         let result = outcomes[server.id]
         let outcome = result?.outcome
+        let isLocal = server.isLocal == true
         let isWorking = active == server.id
         return VStack(alignment: .leading, spacing: 22) {
             HStack(alignment: .top) {
@@ -503,10 +510,11 @@ struct MainView: View {
                         .foregroundStyle(outcome?.success == true ? Color.green : Color.secondary)
                 }
                 VStack(alignment: .leading, spacing: 5) {
-                    Text(isWorking ? "正在检查服务器…" : outcome?.title ?? "等待检查")
+                    Text(isWorking ? (isLocal ? "正在检查本机…" : "正在检查服务器…")
+                        : outcome?.title(isLocal: isLocal) ?? "等待检查")
                         .font(.headline)
                     Text(isWorking ? (server.isLocal == true ? "正在检查本机网络。" : "正在通过 SSH 连接 \(server.name)。") :
-                        result?.detail ?? outcome?.detail ?? "可以检查联网状态，或登录校园网。")
+                        result?.detail ?? outcome?.detail(isLocal: isLocal) ?? "可以检查联网状态，或登录校园网。")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -523,8 +531,11 @@ struct MainView: View {
                 if server.isLocal == true && server.autoJoinCampusWiFi == true {
                     Text("自动连接 SUDA_WIFI")
                 }
-                if server.automatic == true {
-                    Text(automaticPaused ? "自动联网已暂停" : "每 \(server.intervalMinutes ?? 5) 分钟检查并自动联网")
+                if automaticPauseUntil > Date().timeIntervalSince1970 {
+                    let resumeDate = Date(timeIntervalSince1970: automaticPauseUntil)
+                    Text("\(resumeDate.formatted(date: .abbreviated, time: .shortened)) 恢复自动联网")
+                } else if server.automatic == true {
+                    Text("每 \(server.intervalMinutes ?? 5) 分钟检查并自动联网")
                 }
             }
             .font(.caption)
@@ -533,13 +544,16 @@ struct MainView: View {
             Spacer(minLength: 0)
 
             HStack {
-                Button("登录校园网") { connect(server, authenticate: true) }
-                    .buttonStyle(.borderedProminent)
-                    .keyboardShortcut(.defaultAction)
-                Button("检查连接") { connect(server, authenticate: false) }
+                Group {
+                    Button("登录校园网") { connect(server, authenticate: true) }
+                        .buttonStyle(.borderedProminent)
+                        .keyboardShortcut(.defaultAction)
+                    Button("检查连接") { connect(server, authenticate: false) }
+                }
+                .disabled(active != nil)
+                AutomaticPauseActions(showsResumeTime: false)
             }
             .controlSize(.large)
-            .disabled(active != nil)
         }
         .padding(23)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -770,7 +784,6 @@ struct EditorView: View {
 }
 
 extension Notification.Name {
-    static let pauseCampusAutomatic = Notification.Name("pauseCampusAutomatic")
     static let clearCampusData = Notification.Name("clearCampusData")
 }
 
@@ -791,17 +804,13 @@ final class CampusAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
 
 struct CampusMenu: View {
     @Environment(\.openWindow) private var openWindow
-    @State private var paused = false
 
     var body: some View {
         Button("打开校园网登录") {
             openWindow(id: "main")
             NSApplication.shared.activate(ignoringOtherApps: true)
         }
-        Button(paused ? "恢复自动联网" : "暂停自动联网") {
-            paused.toggle()
-            NotificationCenter.default.post(name: .pauseCampusAutomatic, object: nil)
-        }
+        AutomaticPauseActions()
         Divider()
         Button("清除全部数据并退出…") {
             openWindow(id: "main")
@@ -809,6 +818,48 @@ struct CampusMenu: View {
             NotificationCenter.default.post(name: .clearCampusData, object: nil)
         }
         Button("退出") { NSApplication.shared.terminate(nil) }
+    }
+}
+
+struct AutomaticPauseActions: View {
+    @AppStorage("automaticPauseUntil") private var automaticPauseUntil: Double = 0
+    var showsResumeTime = true
+
+    var body: some View {
+        if automaticPauseUntil > Date().timeIntervalSince1970 {
+            if showsResumeTime {
+                let resumeDate = Date(timeIntervalSince1970: automaticPauseUntil)
+                Text("\(resumeDate.formatted(date: .abbreviated, time: .shortened)) 恢复自动联网")
+            }
+            Button("立即恢复") { automaticPauseUntil = 0 }
+            Button("调整暂停时长…") { setPauseDuration() }
+        } else {
+            Button("暂停自动重连…") { setPauseDuration() }
+        }
+    }
+
+    private func setPauseDuration() {
+        let minutesField = NSTextField(string: "30")
+        minutesField.frame = NSRect(x: 0, y: 0, width: 200, height: 24)
+        minutesField.setAccessibilityLabel("暂停分钟数")
+
+        let alert = NSAlert()
+        alert.messageText = "暂停自动重连"
+        alert.informativeText = "请输入暂停分钟数。到时间后，自动重连会自行恢复。"
+        alert.accessoryView = minutesField
+        alert.window.initialFirstResponder = minutesField
+        alert.addButton(withTitle: "暂停")
+        alert.addButton(withTitle: "取消")
+        NSApplication.shared.activate(ignoringOtherApps: true)
+
+        while alert.runModal() == .alertFirstButtonReturn {
+            let input = minutesField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let minutes = Int32(input), minutes > 0 {
+                automaticPauseUntil = Date().addingTimeInterval(Double(minutes) * 60).timeIntervalSince1970
+                return
+            }
+            alert.informativeText = "请输入有效的正整数分钟数。"
+        }
     }
 }
 
