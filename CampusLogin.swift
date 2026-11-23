@@ -52,6 +52,7 @@ struct Server: Codable, Identifiable, Sendable {
     var automatic: Bool? = false
     var intervalMinutes: Int? = 5
     var autoJoinCampusWiFi: Bool? = false
+    var reconnectAfterGatewayTimeout: Bool? = false
 
 }
 
@@ -124,6 +125,7 @@ enum Passwords {
 enum Outcome: String, Decodable, Sendable {
     case online, restored, offline, credentialsRequired = "credentials_required"
     case portalChanged = "portal_changed", portalError = "portal_error"
+    case gatewayTimeout = "gateway_timeout", gatewayUnreachable = "gateway_unreachable"
     case authenticationFailed = "authentication_failed", acceptedOffline = "accepted_offline"
     case sshFailed, localNetwork, sshKey, remoteError, timedOut, wifiFailed, wifiDisconnected
 
@@ -135,6 +137,8 @@ enum Outcome: String, Decodable, Sendable {
         case .credentialsRequired: "需要登录校园网"
         case .portalChanged: "无法识别认证页面"
         case .portalError: "校园网网关异常"
+        case .gatewayTimeout: "认证网关连接超时"
+        case .gatewayUnreachable: "无法连接认证网关"
         case .authenticationFailed: "校园网登录失败"
         case .acceptedOffline: "认证已通过"
         case .sshFailed: "SSH 连接失败"
@@ -156,6 +160,8 @@ enum Outcome: String, Decodable, Sendable {
         case .credentialsRequired: "请在「编辑」中确认校园网账号、密码和运营商，再点「登录校园网」。"
         case .portalChanged: "此版本支持苏州大学的 Dr.COM 认证网关。"
         case .portalError: "无法访问校园网网关，或网关返回了无法识别的响应。"
+        case .gatewayTimeout: "本机已连接 SUDA_WIFI，校园网认证网关没有及时响应。"
+        case .gatewayUnreachable: "本机无法连到校园网认证服务，请检查网络。"
         case .authenticationFailed: "请核对该服务器使用的校园网账号、密码和运营商。"
         case .acceptedOffline: isLocal
             ? "网关已接受登录，本机的联网检查仍未通过。"
@@ -209,9 +215,14 @@ final class WiFiLocationPermission: NSObject, ObservableObject, CLLocationManage
 enum CampusWiFi {
     static let ssid = "SUDA_WIFI"
 
-    private static func hasAddress(_ name: String) -> Bool {
+    enum Preparation {
+        case ready(String)
+        case failed(ServerResult)
+    }
+
+    private static func address(_ name: String) -> String? {
         var addresses: UnsafeMutablePointer<ifaddrs>?
-        guard getifaddrs(&addresses) == 0 else { return false }
+        guard getifaddrs(&addresses) == 0 else { return nil }
         defer { freeifaddrs(addresses) }
         var current = addresses
         while let entry = current {
@@ -220,44 +231,76 @@ enum CampusWiFi {
                let address = item.ifa_addr, address.pointee.sa_family == UInt8(AF_INET) {
                 let ipv4 = UnsafeRawPointer(address).assumingMemoryBound(to: sockaddr_in.self).pointee
                 let number = UInt32(bigEndian: ipv4.sin_addr.s_addr)
-                if number != 0 && number >> 16 != 0xA9FE { return true }
+                if number != 0 && number >> 16 != 0xA9FE {
+                    var host = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+                    if getnameinfo(address, socklen_t(address.pointee.sa_len), &host,
+                                   socklen_t(host.count), nil, 0, NI_NUMERICHOST) == 0 {
+                        return String(cString: host)
+                    }
+                }
             }
             current = item.ifa_next
         }
-        return false
+        return nil
     }
 
-    /// A nil result means Wi-Fi association and DHCP are ready for portal checking.
-    static func prepare() -> ServerResult? {
+    static func prepare(reconnect: Bool = false) -> Preparation {
         guard let interface = CWWiFiClient.shared().interface(),
               let name = interface.interfaceName else {
-            return ServerResult(outcome: .wifiFailed, detail: "未找到可用的 Wi-Fi 网卡。")
+            return .failed(ServerResult(outcome: .wifiFailed, detail: "未找到可用的 Wi-Fi 网卡。"))
         }
         guard interface.powerOn() else {
-            return ServerResult(outcome: .wifiDisconnected, detail: "请先开启 Mac 的 Wi-Fi，再重试。")
+            return .failed(ServerResult(outcome: .wifiDisconnected, detail: "请先开启 Mac 的 Wi-Fi，再重试。"))
         }
         do {
-            if interface.ssid() != ssid {
+            if reconnect || interface.ssid() != ssid {
                 let networks = try interface.scanForNetworks(withSSID: Data(ssid.utf8))
                 guard let network = networks
                     .filter({ $0.ssid == ssid })
                     .max(by: { $0.rssiValue < $1.rssiValue }) else {
-                    return ServerResult(outcome: .wifiDisconnected, detail: "未发现 SUDA_WIFI，请确认校园 Wi-Fi 在信号范围内。")
+                    let outcome: Outcome = interface.ssid() == ssid ? .wifiFailed : .wifiDisconnected
+                    return .failed(ServerResult(outcome: outcome, detail: "未发现可连接的 SUDA_WIFI，请确认校园 Wi-Fi 信号。"))
+                }
+                if reconnect {
+                    guard interface.ssid() == ssid else {
+                        return .failed(ServerResult(outcome: .wifiDisconnected, detail: "当前 Wi-Fi 已变化，请重新检查校园网。"))
+                    }
+                    interface.disassociate()
                 }
                 try interface.associate(to: network, password: nil)
             }
             let deadline = Date().addingTimeInterval(15)
             repeat {
-                if interface.ssid() == ssid && hasAddress(name) { return nil }
+                if interface.ssid() == ssid, let ipv4 = address(name) { return .ready(ipv4) }
                 Thread.sleep(forTimeInterval: 0.5)
             } while Date() < deadline
             guard interface.ssid() == ssid else {
-                return ServerResult(outcome: .wifiDisconnected, detail: "Wi-Fi 未能保持连接，请确认 SUDA_WIFI 信号后重试。")
+                return .failed(ServerResult(outcome: .wifiDisconnected, detail: "Wi-Fi 未能保持连接，请确认 SUDA_WIFI 信号后重试。"))
             }
-            return ServerResult(outcome: .wifiFailed, detail: "连接 SUDA_WIFI 后尚未获得有效网络地址，请稍后重试。")
+            return .failed(ServerResult(outcome: .wifiFailed, detail: "连接 SUDA_WIFI 后尚未获得有效网络地址，请稍后重试。"))
         } catch {
-            return ServerResult(outcome: .wifiDisconnected, detail: "连接 SUDA_WIFI 失败：" + error.localizedDescription)
+            let outcome: Outcome = interface.ssid() == ssid ? .wifiFailed : .wifiDisconnected
+            return .failed(ServerResult(outcome: outcome, detail: "连接 SUDA_WIFI 失败：" + error.localizedDescription))
         }
+    }
+}
+
+struct GatewayTimeoutStreak {
+    static let cooldown: TimeInterval = 5 * 60
+    private var consecutive = 0
+
+    mutating func record(
+        _ outcome: Outcome, automatic: Bool, canReconnect: Bool, now: TimeInterval, lastAttempt: TimeInterval
+    ) -> Bool {
+        guard outcome == .gatewayTimeout else {
+            consecutive = 0
+            return false
+        }
+        guard automatic else { return false }
+        consecutive = min(consecutive + 1, 2)
+        guard consecutive == 2, canReconnect, now - lastAttempt >= Self.cooldown else { return false }
+        consecutive = 0
+        return true
     }
 }
 
@@ -266,13 +309,30 @@ enum CampusSSH {
         let username: String
         let password: String
         let suffix: String
+        let wifiAddress: String?
     }
 
-    static func run(_ server: Server, password: String?) -> ServerResult {
+    static func check(_ server: Server, authenticate: Bool, automatic: Bool,
+                      joinWiFi: Bool, reconnect: Bool = false) throws -> ServerResult {
+        var wifiAddress: String?
+        if joinWiFi {
+            switch CampusWiFi.prepare(reconnect: reconnect) {
+            case .ready(let address): wifiAddress = address
+            case .failed(let result): return result
+            }
+        }
+        let result = run(server, password: nil, wifiAddress: wifiAddress)
+        guard authenticate, result.outcome == .credentialsRequired, !server.username.isEmpty else { return result }
+        let password = try Passwords.read(server.id, interactive: !automatic)
+        return run(server, password: password, wifiAddress: wifiAddress)
+    }
+
+    private static func run(_ server: Server, password: String?, wifiAddress: String?) -> ServerResult {
         guard let scriptURL = Bundle.main.url(forResource: "portal", withExtension: "py"),
               let script = try? String(contentsOf: scriptURL, encoding: .utf8),
               let payload = try? JSONEncoder().encode(Credentials(
-                username: server.username, password: password ?? "", suffix: server.service.suffix
+                username: server.username, password: password ?? "", suffix: server.service.suffix,
+                wifiAddress: wifiAddress
               )) else { return ServerResult(outcome: .remoteError) }
 
         let command = "python3 -c '" + script.replacingOccurrences(of: "'", with: "'\\''") + "'"
@@ -334,6 +394,7 @@ struct MainView: View {
     @AppStorage("servers") private var savedServers = Data()
     @AppStorage("selectedServer") private var savedSelection = ""
     @AppStorage("automaticPauseUntil") private var automaticPauseUntil: Double = 0
+    @AppStorage("lastCampusWiFiReconnect") private var lastCampusWiFiReconnect: Double = 0
     @State private var servers = [Server]()
     @State private var selection: UUID?
     @State private var editor: Server?
@@ -342,6 +403,7 @@ struct MainView: View {
     @State private var active: UUID?
     @State private var errorMessage: String?
     @State private var lastChecks = [UUID: Date]()
+    @State private var gatewayTimeouts = [UUID: GatewayTimeoutStreak]()
     @State private var isClearingData = false
     private let timer = Timer.publish(every: 15, on: .main, in: .common).autoconnect()
 
@@ -462,6 +524,7 @@ struct MainView: View {
                     try Passwords.delete(server.id)
                     servers.removeAll { $0.id == server.id }
                     outcomes[server.id] = nil
+                    gatewayTimeouts[server.id] = nil
                     if selection == server.id { selection = servers.first?.id }
                     persist()
                 } catch {
@@ -571,6 +634,7 @@ struct MainView: View {
             servers.append(server)
         }
         outcomes[server.id] = nil
+        gatewayTimeouts[server.id] = nil
         persist()
         selection = server.id
     }
@@ -578,6 +642,7 @@ struct MainView: View {
     private func connect(_ server: Server, authenticate: Bool, automatic: Bool = false) {
         let joinWiFi = server.isLocal == true && server.autoJoinCampusWiFi == true
         if joinWiFi && !WiFiLocationPermission.shared.authorized {
+            gatewayTimeouts[server.id] = nil
             if !automatic { WiFiLocationPermission.shared.request() }
             outcomes[server.id] = ServerResult(
                 outcome: .wifiFailed,
@@ -589,15 +654,25 @@ struct MainView: View {
         active = server.id
         Task {
             do {
-                let outcome = try await Task.detached(priority: .userInitiated) {
-                    if joinWiFi, let failure = CampusWiFi.prepare() { return failure }
-                    let check = CampusSSH.run(server, password: nil)
-                    guard authenticate, check.outcome == .credentialsRequired, !server.username.isEmpty else { return check }
-                    let password = try Passwords.read(server.id, interactive: !automatic)
-                    return CampusSSH.run(server, password: password)
+                var outcome = try await Task.detached(priority: .userInitiated) {
+                    try CampusSSH.check(server, authenticate: authenticate, automatic: automatic, joinWiFi: joinWiFi)
                 }.value
+                let now = Date().timeIntervalSince1970
+                let canReconnect = joinWiFi && server.reconnectAfterGatewayTimeout == true
+                    && now >= automaticPauseUntil
+                if gatewayTimeouts[server.id, default: GatewayTimeoutStreak()].record(
+                    outcome.outcome, automatic: automatic, canReconnect: canReconnect,
+                    now: now, lastAttempt: lastCampusWiFiReconnect
+                ) {
+                    lastCampusWiFiReconnect = now
+                    outcome = try await Task.detached(priority: .userInitiated) {
+                        try CampusSSH.check(server, authenticate: authenticate, automatic: automatic,
+                                            joinWiFi: true, reconnect: true)
+                    }.value
+                }
                 outcomes[server.id] = outcome
             } catch {
+                gatewayTimeouts[server.id] = nil
                 if automatic {
                     outcomes[server.id] = ServerResult(outcome: .credentialsRequired, detail: "自动联网无法读取密码，请手动登录并完成钥匙串授权。")
                 } else {
@@ -701,6 +776,14 @@ struct EditorView: View {
                     if server.autoJoinCampusWiFi == true {
                         Text("登录和定时检查时会切换到 SUDA_WIFI，需要定位权限识别网络。")
                             .font(.caption).foregroundStyle(.secondary)
+                        Toggle("认证网关超时后重连 SUDA_WIFI", isOn: Binding(
+                            get: { server.reconnectAfterGatewayTimeout == true },
+                            set: { server.reconnectAfterGatewayTimeout = $0 }
+                        ))
+                        if server.reconnectAfterGatewayTimeout == true {
+                            Text("连续两次自动检查超时后尝试重连，每 5 分钟最多一次。")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
                     }
                 }
                 TextField("校园网账号", text: $server.username)

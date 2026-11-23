@@ -5,6 +5,7 @@ import http.client
 import ipaddress
 import json
 import re
+import socket
 import subprocess
 import sys
 import time
@@ -12,18 +13,22 @@ import urllib.parse
 
 
 PORTAL_HOST = "10.9.1.3"
+PORTAL_PORT = 801
 CHECK_HOST = "connectivitycheck.gstatic.com"
 CHECK_PATH = "/generate_204"
 
 
 def public_probe(scheme, host, path):
     # curl's deadline includes DNS resolution. No local proxy or curlrc.
-    result = subprocess.run(
-        ["curl", "--disable", "--noproxy", "*", "--silent", "--max-time", "3",
-         "--write-out", "\n%{http_code}\n%{redirect_url}",
-         f"{scheme}://{host}{path}"],
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=4,
-    )
+    try:
+        result = subprocess.run(
+            ["curl", "--disable", "--noproxy", "*", "--silent", "--max-time", "3",
+             "--write-out", "\n%{http_code}\n%{redirect_url}",
+             f"{scheme}://{host}{path}"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=4,
+        )
+    except subprocess.TimeoutExpired:
+        return 0, "", b""
     if result.returncode:
         return 0, "", b""
     body, status, redirect = result.stdout.rsplit(b"\n", 2)
@@ -52,8 +57,22 @@ def captive_redirect():
     return None
 
 
-def submit(fields):
-    connection = http.client.HTTPConnection(PORTAL_HOST, 801, timeout=4)
+def gateway_failure(address):
+    try:
+        with socket.create_connection((PORTAL_HOST, PORTAL_PORT), timeout=3,
+                                      source_address=(address, 0)):
+            return None
+    except TimeoutError:
+        return "gateway_timeout"
+    except OSError:
+        return "gateway_unreachable"
+
+
+def submit(fields, wifi_address=None):
+    source = (wifi_address, 0) if wifi_address else None
+    connection = http.client.HTTPConnection(
+        PORTAL_HOST, PORTAL_PORT, timeout=4, source_address=source
+    )
     try:
         connection.request("GET", "/eportal/?" + urllib.parse.urlencode(fields))
         response = connection.getresponse()
@@ -134,7 +153,7 @@ def authenticate(credentials, redirect):
         "jsVersion": "3.3.3",
     }
     # Use only the observed official portal. Never follow a credentialed redirect.
-    status, body = submit(fields)
+    status, body = submit(fields, credentials.get("wifiAddress"))
     if status != 200:
         return {"outcome": "portal_error", "detail": f"网关返回 HTTP {status}。"}
     callback = re.fullmatch(r"campusLogin\s*\((.*)\)\s*;?\s*", body.decode("gb18030", "replace").strip(), re.S)
@@ -157,13 +176,22 @@ def run(credentials):
     if online():
         return "online"
     redirect = captive_redirect()
-    if redirect is None:
-        return "offline"
-    if (
+    if redirect is not None and (
         redirect.scheme != "http" or redirect.netloc != PORTAL_HOST
         or redirect.path.lower() != "/a79.htm"
     ):
         return "portal_changed"
+    wifi_address = credentials.get("wifiAddress")
+    if wifi_address:
+        failure = gateway_failure(wifi_address)
+        if failure:
+            return failure
+        if redirect is not None:
+            query = urllib.parse.parse_qs(redirect.query)
+            if query.get("wlanuserip", [None])[0] != wifi_address:
+                return "portal_changed"
+    if redirect is None:
+        return "offline"
     if not credentials["password"]:
         return "credentials_required"
     return authenticate(credentials, redirect)
